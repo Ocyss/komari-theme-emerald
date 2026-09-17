@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { PublicPingTaskOrderItem } from '@/utils/pingTaskOrder'
 import { Icon } from '@iconify/vue'
 import dayjs from 'dayjs'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
@@ -10,6 +11,10 @@ import { Spinner } from '@/components/ui/spinner'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBackgroundSurface } from '@/composables/useBackgroundSurface'
 import { useAppStore } from '@/stores/app'
+import {
+
+  sortTasksByPublicOrder,
+} from '@/utils/pingTaskOrder'
 import { cutPeakValues, interpolateNullsLinear } from '@/utils/recordHelper'
 import { getSharedRpc, RpcError } from '@/utils/rpc'
 import '@/utils/echarts' // 共享 ECharts 配置
@@ -266,7 +271,7 @@ function pushLatencyMetricPoint(
 }
 
 async function fetchMetricRecords(uuid: string, hours: number): Promise<PingChartData> {
-  const [metricResult, statsResult, lossResult] = await Promise.all([
+  const [metricResult, statsResult, lossResult, publicTasks] = await Promise.all([
     rpc.getClient().call<MetricQueryResponse>('public:queryMetrics', {
       // 与官方主题一致：延迟曲线只吃 ping.latency_ms；丢包率走 getPingMetricStats
       metric_keys: ['ping.latency_ms'],
@@ -292,6 +297,9 @@ async function fetchMetricRecords(uuid: string, hours: number): Promise<PingChar
       aggregation: 'avg',
       fill_empty: true,
     }).catch(() => null),
+    // getPingMetricStats 按 task_id 排序，后台拖拽顺序在 weight 上；
+    // 与官方主题一致，用 getPublicPingTasks（weight ASC, id ASC）重排展示顺序
+    rpc.getClient().call<PublicPingTaskOrderItem[]>('public:getPublicPingTasks').catch(() => []),
   ])
 
   const records: PingRecord[] = []
@@ -325,35 +333,54 @@ async function fetchMetricRecords(uuid: string, hours: number): Promise<PingChar
     }
   }
 
-  const metricTasks = (statsResult?.stats ?? []).map(task => ({
-    id: Number(task.task_id),
-    name: task.name || `Ping ${task.task_id}`,
-    interval: task.interval ?? 60,
-    loss: task.loss,
-    p99: task.p99,
-    p50: task.p50,
-    p99_p50_ratio: task.p99_p50_ratio,
-    min: task.min,
-    max: task.max,
-    avg: task.avg,
-    latest: task.latest,
-    total: task.total,
-    type: task.type,
-  })).filter(task => Number.isInteger(task.id))
+  const publicTaskList = Array.isArray(publicTasks) ? publicTasks : []
+  const publicTaskNameMap = new Map(
+    publicTaskList.map(task => [task.id, task.name?.trim() || ''] as const),
+  )
 
-  return { records, tasks: metricTasks, lossRecords }
+  const metricTasks = (statsResult?.stats ?? []).map((task) => {
+    const id = Number(task.task_id)
+    const publicName = publicTaskNameMap.get(id)
+    return {
+      id,
+      name: publicName || task.name || `Ping ${task.task_id}`,
+      interval: task.interval ?? 60,
+      loss: task.loss,
+      p99: task.p99,
+      p50: task.p50,
+      p99_p50_ratio: task.p99_p50_ratio,
+      min: task.min,
+      max: task.max,
+      avg: task.avg,
+      latest: task.latest,
+      total: task.total,
+      type: task.type,
+    }
+  }).filter(task => Number.isInteger(task.id))
+
+  return {
+    records,
+    tasks: sortTasksByPublicOrder(metricTasks, publicTaskList),
+    lossRecords,
+  }
 }
 
 async function fetchLegacyRecords(uuid: string, hours: number): Promise<PingChartData> {
-  const result = await rpc.getClient().call<PingRecordsResponse>('common:getRecords', {
-    type: 'ping',
-    uuid,
-    hours,
-  })
+  const [result, publicTasks] = await Promise.all([
+    rpc.getClient().call<PingRecordsResponse>('common:getRecords', {
+      type: 'ping',
+      uuid,
+      hours,
+    }),
+    rpc.getClient().call<PublicPingTaskOrderItem[]>('public:getPublicPingTasks').catch(() => []),
+  ])
+
+  const publicTaskList = Array.isArray(publicTasks) ? publicTasks : []
+  const legacyTasks = result?.tasks ?? []
 
   return {
     records: result?.records ?? [],
-    tasks: result?.tasks ?? [],
+    tasks: sortTasksByPublicOrder(legacyTasks, publicTaskList),
   }
 }
 
